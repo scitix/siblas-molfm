@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siblas"
+version = "0.1.0"
+description = "GEMM interface for linear layers (N=256, K=256) with cuBLAS TF32"
+requires-python = ">=3.8"
+dependencies = ["torch"]

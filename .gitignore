@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Conda / venv
+.conda/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
