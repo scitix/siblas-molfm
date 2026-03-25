@@ -28,5 +28,8 @@ env/
 .DS_Store
 Thumbs.db
 
+# Third-party dependencies (auto-downloaded)
+third_party/
+
 # Claude Code
 .claude/

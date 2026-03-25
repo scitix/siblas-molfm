@@ -1,31 +1,232 @@
 #include "siblas.h"
 
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h> // 必须 include 这个头文件
 
 #include <stdexcept>
+#include <mutex>
+
+// CUTLASS includes
+#include "cutlass/cutlass.h"
+
+#include "cute/tensor.hpp"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include "cutlass/gemm/collective/sm100_mma_warpspecialized_emulated_optimized.hpp"
+
+#include "cutlass/util/command_line.h"
+#include "cutlass/util/distribution.h"
+#include "cutlass/util/host_tensor.h"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/tensor_view_io.h"
+#include "cutlass/util/reference/device/gemm.h"
+#include "cutlass/util/reference/device/tensor_compare.h"
+#include "cutlass/util/reference/device/tensor_fill.h"
+
+using namespace cute;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+/// CUTLASS BF16x6 emulated FP32 GEMM kernel configurations
+/// Based on CUTLASS example 78b (Blackwell SM100)
+///
+/// We define two GEMM kernel types:
+///   GemmNN: A=RowMajor,   B=ColumnMajor  (used for forward Y=X@W^T and backward dX=dY@W)
+///   GemmNT: A=RowMajor,   B=RowMajor     (used for backward dW=dY^T@X)
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Common configuration
+using ElementInput        = float;
+using ElementOutput       = float;
+using ElementAccumulator  = float;
+using ArchTag             = cutlass::arch::Sm100;
+using OperatorClass       = cutlass::arch::OpClassTensorOp;
+constexpr int Alignment   = 128 / cutlass::sizeof_bits<float>::value;  // = 4
+
+// Kernel perf config
+using ClusterShape        = Shape<_2,_1,_1>;
+using MmaTileShape        = Shape<_256,_128,_16>;
+
+// Schedule for BF16x6 emulated GEMM (non-Smem variant: A operand in TMEM)
+using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GemmNN: A = RowMajor, B = ColumnMajor -> C = ColumnMajor
+// Used for:
+//   Forward:       Y[M,N] = X[M,K](RowMajor) @ W^T  =>  B = W[N,K] treated as ColMajor[K,N]
+//   Backward dX:   dX[M,K] = dY[M,N](RowMajor) @ W  =>  B = W[N,K] treated as ColMajor[K,N]
+//                   but note: for dX, the GEMM is C[M,K] = A[M,N] * B_col[N,K]
+//                   We must reinterpret: W[N,K] row-major is the same memory layout as W^T[K,N] col-major
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+using LayoutA_NN          = cutlass::layout::RowMajor;
+using LayoutB_NN          = cutlass::layout::ColumnMajor;
+using LayoutC_NN          = cutlass::layout::RowMajor;    // 修复 Bug 1：必须是 RowMajor
+
+using CollectiveEpilogue_NN = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    MmaTileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementOutput, LayoutC_NN, Alignment,
+    ElementOutput, LayoutC_NN, Alignment,
+    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
+  >::CollectiveOp;
+
+using CollectiveMainloop_NN = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementInput, LayoutA_NN, Alignment,
+    ElementInput, LayoutB_NN, Alignment,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue_NN::SharedStorage))>,
+    MainloopSchedule
+  >::CollectiveOp;
+
+using GemmKernel_NN = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int,int>,
+    CollectiveMainloop_NN,
+    CollectiveEpilogue_NN,
+    void>;
+
+using GemmNN = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NN>;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GemmNT: A = RowMajor, B = RowMajor -> C = ColumnMajor
+// Used for:
+//   Backward dW: dW[N,K] = dY^T[N,M] @ X[M,K]
+//   We compute: C[N,K] = dY^T @ X
+//   In CUTLASS terms: A = dY viewed as ColMajor (to get dY^T as RowMajor), B = X RowMajor
+//   Actually simpler: use A=ColumnMajor for dY[M,N] (gives us dY^T[N,M] in row-major sense)
+//                     B=RowMajor for X[M,K]
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+using LayoutA_NT          = cutlass::layout::ColumnMajor;  // dY[M,N] col-major = dY^T[N,M] row-major
+using LayoutB_NT          = cutlass::layout::RowMajor;
+using LayoutC_NT          = cutlass::layout::RowMajor;
+
+using CollectiveEpilogue_NT = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    MmaTileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementOutput, LayoutC_NT, Alignment,
+    ElementOutput, LayoutC_NT, Alignment,
+    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
+  >::CollectiveOp;
+
+using CollectiveMainloop_NT = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementInput, LayoutA_NT, Alignment,
+    ElementInput, LayoutB_NT, Alignment,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue_NT::SharedStorage))>,
+    MainloopSchedule
+  >::CollectiveOp;
+
+using GemmKernel_NT = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int,int>,
+    CollectiveMainloop_NT,
+    CollectiveEpilogue_NT,
+    void>;
+
+using GemmNT = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NT>;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Stride types
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+using StrideA_NN = typename GemmNN::GemmKernel::StrideA;
+using StrideB_NN = typename GemmNN::GemmKernel::StrideB;
+using StrideC_NN = typename GemmNN::GemmKernel::StrideC;
+using StrideD_NN = typename GemmNN::GemmKernel::StrideD;
+
+using StrideA_NT = typename GemmNT::GemmKernel::StrideA;
+using StrideB_NT = typename GemmNT::GemmKernel::StrideB;
+using StrideC_NT = typename GemmNT::GemmKernel::StrideC;
+using StrideD_NT = typename GemmNT::GemmKernel::StrideD;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper: run a CUTLASS GEMM
+/////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace {
 
-// Get or create a per-device cuBLAS handle (thread-local cache)
-cublasHandle_t get_cublas_handle() {
-    static thread_local cublasHandle_t handle = nullptr;
-    if (handle == nullptr) {
-        cublasStatus_t status = cublasCreate(&handle);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("Failed to create cuBLAS handle");
-        }
-        // Enable TF32 for FP32 GEMM (Ampere+)
-        cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+template <typename GemmType>
+void run_cutlass_gemm(
+    int M, int N, int K,
+    float alpha, float beta,
+    const float* A, const float* B,
+    const float* C, float* D,
+    cudaStream_t stream) {
+
+    using StrideA = typename GemmType::GemmKernel::StrideA;
+    using StrideB = typename GemmType::GemmKernel::StrideB;
+    using StrideC = typename GemmType::GemmKernel::StrideC;
+    using StrideD = typename GemmType::GemmKernel::StrideD;
+
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+
+    typename GemmType::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {A, stride_A, B, stride_B},
+        {{alpha, beta}, C, stride_C, D, stride_D}
+    };
+
+    GemmType gemm;
+
+    size_t workspace_size = GemmType::get_workspace_size(arguments);
+    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)}, 
+                              torch::TensorOptions().device(torch::kCUDA).dtype(torch::kUInt8));
+    cutlass::Status status;
+
+    status = gemm.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error(
+            std::string("CUTLASS GEMM can_implement failed: ") +
+            cutlass::cutlassGetStatusString(status));
     }
-    return handle;
+
+    status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error(
+            std::string("CUTLASS GEMM initialize failed: ") +
+            cutlass::cutlassGetStatusString(status));
+    }
+
+    status = gemm.run(stream);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error(
+            std::string("CUTLASS GEMM run failed: ") +
+            cutlass::cutlassGetStatusString(status));
+    }
 }
 
 }  // namespace
 
+/////////////////////////////////////////////////////////////////////////////////////////////////
 // Forward: Y = X @ W^T + bias
-// X: [M, K], W: [N, K], bias: [N] (optional) -> Y: [M, N]
+// X: [M, K] RowMajor, W: [N, K] RowMajor, bias: [N] -> Y: [M, N]
+//
+// CUTLASS GEMM (GemmNN):
+//   A = X [M, K] RowMajor
+//   B = W [N, K] RowMajor memory = [K, N] ColumnMajor
+//   C = Y [M, N] (output, ColumnMajor for CUTLASS)
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 torch::Tensor siblas_linear_forward(
     const torch::Tensor& input,
     const torch::Tensor& weight,
@@ -36,7 +237,6 @@ torch::Tensor siblas_linear_forward(
     TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
     TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
 
-    // input: [M, K], weight: [N, K]
     const int M = input.size(0);
     const int K = input.size(1);
     const int N = weight.size(0);
@@ -44,39 +244,24 @@ torch::Tensor siblas_linear_forward(
     TORCH_CHECK(weight.size(1) == K,
                 "weight K dimension mismatch: expected ", K, " got ", weight.size(1));
 
-    // Ensure contiguous
     auto input_c = input.contiguous();
     auto weight_c = weight.contiguous();
 
     // Allocate output [M, N]
     auto output = torch::empty({M, N}, input.options());
 
-    cublasHandle_t handle = get_cublas_handle();
-    cublasSetStream(handle, c10::cuda::getCurrentCUDAStream());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // Y = X @ W^T
-    // X: [M, K], W^T: [K, N]
-    // A = X [M, K], B = W^T [K, N], C = Y [M, N]
-    // In row-major: C[M,N] = A[M,K] * B[K,N]
-    // But W is [N, K], so W^T is [K, N]
-    // cuBLAS col-major: C^T[N,M] = (W^T)^T[N,K] * X^T[K,M] = W[N,K] * X^T[K,M]
-    {
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t status = cublasSgemm(
-            handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            weight_c.data_ptr<float>(), K,   // W[N,K] row-major -> col-major lda=K, op=T
-            input_c.data_ptr<float>(), K,    // X[M,K] row-major -> col-major lda=K, op=N
-            &beta,
-            output.data_ptr<float>(), N);    // Y[M,N] row-major -> col-major ld=N
-
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("cuBLAS SGEMM failed in forward");
-        }
-    }
+    // Y = X @ W^T using CUTLASS BF16x6 emulated FP32
+    // GemmNN: A[M,K]=RowMajor, B[N,K]=RowMajor-as-ColMajor, C/D[M,N]=ColMajor
+    run_cutlass_gemm<GemmNN>(
+        M, N, K,
+        1.0f, 0.0f,
+        input_c.data_ptr<float>(),
+        weight_c.data_ptr<float>(),
+        output.data_ptr<float>(),   // C (unused with beta=0)
+        output.data_ptr<float>(),   // D
+        stream);
 
     // Add bias if provided
     if (bias.defined() && bias.numel() > 0) {
@@ -89,15 +274,18 @@ torch::Tensor siblas_linear_forward(
     return output;
 }
 
+/////////////////////////////////////////////////////////////////////////////////////////////////
 // Backward:
 // grad_input  = grad_output @ W        -> [M, K]
 // grad_weight = grad_output^T @ input   -> [N, K]
 // grad_bias   = sum(grad_output, dim=0) -> [N]
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_linear_backward(
     const torch::Tensor& grad_output,
     const torch::Tensor& input,
     const torch::Tensor& weight) {
-
+    const c10::cuda::OptionalCUDAGuard device_guard(device_of(grad_output));
     TORCH_CHECK(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
@@ -110,53 +298,40 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_linear_backward(
     auto input_c = input.contiguous();
     auto weight_c = weight.contiguous();
 
-    cublasHandle_t handle = get_cublas_handle();
-    cublasSetStream(handle, c10::cuda::getCurrentCUDAStream());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    // ---- grad_input = grad_output @ W -> [M, K] ----
+    // grad_output: [M, N] RowMajor, W: [N, K] RowMajor
+    // This is C[M,K] = A[M,N] * B[N,K]
+    // For GemmNN: A=RowMajor[M,N], B=ColMajor[K,N]
+    //   W[N,K] RowMajor in memory = W^T[K,N] ColMajor ✓
+    // auto grad_input = torch::empty({M, K}, input.options())._zeros();
+    auto grad_input = torch::empty({M, K}, input.options()).zero_();
+    run_cutlass_gemm<GemmNN>(
+        M, K, N,      // GEMM dimensions: M, N_out=K, K_inner=N
+        1.0f, 0.0f,
+        grad_output_c.data_ptr<float>(),   // A [M, N] RowMajor
+        weight_c.data_ptr<float>(),        // B [N, K] RowMajor = [K, N] ColMajor
+        grad_input.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        stream);
 
-    // grad_input = grad_output @ W -> [M, K]
-    // grad_output: [M, N], W: [N, K]
-    // col-major: result^T[K,M] = W^T[K,N] * grad_output^T[N,M]
-    auto grad_input = torch::empty({M, K}, input.options());
-    {
-        cublasStatus_t status = cublasSgemm(
-            handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            K, M, N,
-            &alpha,
-            weight_c.data_ptr<float>(), K,        // W[N,K] row-major -> col-major as [K,N], ld=K
-            grad_output_c.data_ptr<float>(), N,    // dY[M,N] row-major -> col-major as [N,M], ld=N
-            &beta,
-            grad_input.data_ptr<float>(), K);      // dX[M,K] row-major -> col-major as [K,M], ld=K
-
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("cuBLAS SGEMM failed in backward (grad_input)");
-        }
-    }
-
-    // grad_weight = grad_output^T @ input -> [N, K]
+    // ---- grad_weight = grad_output^T @ input -> [N, K] ----
     // grad_output^T: [N, M], input: [M, K]
-    // col-major: result^T[K,N] = input^T[K,M] * grad_output[M,N]
-    auto grad_weight = torch::empty({N, K}, weight.options());
-    {
-        cublasStatus_t status = cublasSgemm(
-            handle,
-            CUBLAS_OP_N, CUBLAS_OP_T,
-            K, N, M,
-            &alpha,
-            input_c.data_ptr<float>(), K,          // X[M,K] row-major -> col-major as [K,M], ld=K
-            grad_output_c.data_ptr<float>(), N,    // dY[M,N] row-major -> col-major as [N,M], ld=N, op=T -> [M,N]
-            &beta,
-            grad_weight.data_ptr<float>(), K);     // dW[N,K] row-major -> col-major as [K,N], ld=K
+    // This is C[N,K] = A^T[N,M] * B[M,K]
+    // For GemmNT: A=ColMajor (dY[M,N] stored col-major = dY^T[N,M] row-major),
+    //             B=RowMajor (X[M,K])
+    auto grad_weight = torch::empty({N, K}, weight.options()).zero_();
+    run_cutlass_gemm<GemmNT>(
+        N, K, M,      // GEMM dimensions: M_out=N, N_out=K, K_inner=M
+        1.0f, 0.0f,
+        grad_output_c.data_ptr<float>(),   // A: dY[M,N] treated as ColMajor -> dY^T[N,M]
+        input_c.data_ptr<float>(),         // B: X[M,K] RowMajor
+        grad_weight.data_ptr<float>(),
+        grad_weight.data_ptr<float>(),
+        stream);
 
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("cuBLAS SGEMM failed in backward (grad_weight)");
-        }
-    }
-
-    // grad_bias = sum(grad_output, dim=0) -> [N]
+    // ---- grad_bias = sum(grad_output, dim=0) -> [N] ----
     auto grad_bias = grad_output.sum(0);
 
     return std::make_tuple(grad_input, grad_weight, grad_bias);
