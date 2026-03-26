@@ -131,22 +131,23 @@ def test_module():
     print("Test 4: SiblasLinear module API check")
     print("=" * 60)
 
-    layer = SiblasLinear(bias=True, device="cuda")
+    N, K = 256, 256
+    layer = SiblasLinear(K, N, bias=True, device="cuda")
     print(f"  Module: {layer}")
 
-    X = torch.rand(16, 256, device="cuda", dtype=torch.float32) - 0.5
+    X = torch.rand(16, K, device="cuda", dtype=torch.float32) - 0.5
     Y = layer(X)
     print(f"  Input:  {X.shape}")
     print(f"  Output: {Y.shape}")
-    assert Y.shape == (16, 256)
+    assert Y.shape == (16, N)
 
     # Test backward through module
     loss = Y.sum()
     loss.backward()
     assert layer.weight.grad is not None
     assert layer.bias.grad is not None
-    assert layer.weight.grad.shape == (256, 256)
-    assert layer.bias.grad.shape == (256,)
+    assert layer.weight.grad.shape == (N, K)
+    assert layer.bias.grad.shape == (N,)
     print("  Gradients computed successfully")
     print("  PASSED\n")
 
@@ -157,10 +158,11 @@ def test_batched():
     print("Test 5: Batched input (3D)")
     print("=" * 60)
 
-    layer = SiblasLinear(bias=True, device="cuda")
-    X = torch.rand(4, 8, 256, device="cuda", dtype=torch.float32) - 0.5
+    N, K = 256, 256
+    layer = SiblasLinear(K, N, bias=True, device="cuda")
+    X = torch.rand(4, 8, K, device="cuda", dtype=torch.float32) - 0.5
     Y = layer(X)
-    assert Y.shape == (4, 8, 256)
+    assert Y.shape == (4, 8, N)
 
     loss = Y.sum()
     loss.backward()
@@ -181,7 +183,7 @@ def test_against_nn_linear():
 
     # Create both layers
     # siblas in FP32, torch_layer in FP64
-    siblas_layer = SiblasLinear(bias=True, device="cuda")
+    siblas_layer = SiblasLinear(K, N, bias=True, device="cuda")
     torch_layer = torch.nn.Linear(K, N, bias=True, device="cuda", dtype=torch.float64)
 
     # Copy weights from siblas to torch layer (and cast to double)

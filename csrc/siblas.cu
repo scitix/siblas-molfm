@@ -1,6 +1,7 @@
 #include "siblas.h"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h> // 必须 include 这个头文件
 
@@ -365,6 +366,187 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_linear_backward(
         input_c.data_ptr<float>(),         // B: X[M,K] RowMajor
         grad_weight.data_ptr<float>(),
         grad_weight.data_ptr<float>(),
+        stream);
+
+    // ---- grad_bias = sum(grad_output, dim=0) -> [N] ----
+    auto grad_bias = grad_output.sum(0);
+
+    return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+/// cuBLAS TF32 Linear implementation
+/// Uses cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 for TF32 Tensor Core acceleration.
+///
+/// Row-major PyTorch tensors in cuBLAS column-major convention:
+///   PyTorch X[M,K] row-major  = cuBLAS X[K,M] col-major
+///   PyTorch W[N,K] row-major  = cuBLAS W[K,N] col-major
+///   PyTorch Y[M,N] row-major  = cuBLAS Y[N,M] col-major
+///
+///   Y = X @ W^T  =>  cuBLAS: Y[N,M] = W[N,K] @ X[K,M]
+///   i.e. cublasGemmEx(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, W, X, Y)
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace {
+
+// Thread-safe cuBLAS handle singleton
+cublasHandle_t get_cublas_handle() {
+    static cublasHandle_t handle = nullptr;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        cublasStatus_t st = cublasCreate(&handle);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("cublasCreate failed");
+        }
+        // Set math mode to TF32
+        cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+    });
+    return handle;
+}
+
+// Helper: run a cuBLAS GEMM with TF32
+// C[m, n] = alpha * op(A)[m, k] @ op(B)[k, n] + beta * C[m, n]
+// All dimensions are in cuBLAS column-major convention.
+void run_cublas_gemm(
+    cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k,
+    float alpha, float beta,
+    const float* A, int lda,
+    const float* B, int ldb,
+    float* C, int ldc,
+    cudaStream_t stream) {
+
+    cublasHandle_t handle = get_cublas_handle();
+    cublasSetStream(handle, stream);
+
+    cublasStatus_t st = cublasGemmEx(
+        handle,
+        transa, transb,
+        m, n, k,
+        &alpha,
+        A, CUDA_R_32F, lda,
+        B, CUDA_R_32F, ldb,
+        &beta,
+        C, CUDA_R_32F, ldc,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            std::string("cuBLAS GemmEx failed with status ") + std::to_string(st));
+    }
+}
+
+}  // namespace
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// cuBLAS TF32 Forward: Y = X @ W^T + bias
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+torch::Tensor siblas_cublas_linear_forward(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias) {
+
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+
+    const int M = input.size(0);
+    const int K = input.size(1);
+    const int N = weight.size(0);
+
+    TORCH_CHECK(weight.size(1) == K,
+                "weight K dimension mismatch: expected ", K, " got ", weight.size(1));
+
+    auto input_c = input.contiguous();
+    auto weight_c = weight.contiguous();
+
+    auto output = torch::empty({M, N}, input.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    // Y = X @ W^T
+    // Row-major in cuBLAS col-major convention:
+    //   Y[N,M] = W[N,K] @ X[K,M]
+    //   W[N,K] row-major = W stored as [K,N] col-major, need CUBLAS_OP_T on lda=K
+    //   X[M,K] row-major = X stored as [K,M] col-major, CUBLAS_OP_N with lda=K
+    //   Y[M,N] row-major = Y stored as [N,M] col-major, ldc=N
+    run_cublas_gemm(
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        1.0f, 0.0f,
+        weight_c.data_ptr<float>(), K,   // W[N,K] row-major -> lda=K
+        input_c.data_ptr<float>(),  K,   // X[M,K] row-major -> ldb=K
+        output.data_ptr<float>(),   N,   // Y[M,N] row-major -> ldc=N
+        stream);
+
+    // Add bias if provided
+    if (bias.defined() && bias.numel() > 0) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+        TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+        TORCH_CHECK(bias.size(0) == N, "bias size mismatch");
+        output.add_(bias.unsqueeze(0));
+    }
+
+    return output;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// cuBLAS TF32 Backward
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_cublas_linear_backward(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight) {
+
+    const c10::cuda::OptionalCUDAGuard device_guard(device_of(grad_output));
+    TORCH_CHECK(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+
+    const int M = grad_output.size(0);
+    const int N = grad_output.size(1);
+    const int K = weight.size(1);
+
+    auto grad_output_c = grad_output.contiguous();
+    auto input_c = input.contiguous();
+    auto weight_c = weight.contiguous();
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    // ---- grad_input = grad_output @ W -> [M, K] ----
+    // Row-major: dX[M,K] = dY[M,N] @ W[N,K]
+    // cuBLAS col-major: dX[K,M] = W^T[K,N] @ dY[N,M]
+    //   W[N,K] row-major stored as [K,N] col-major, CUBLAS_OP_N, lda=K
+    //   dY[M,N] row-major stored as [N,M] col-major, CUBLAS_OP_N, ldb=N
+    //   dX[M,K] row-major stored as [K,M] col-major, ldc=K
+    auto grad_input = torch::empty({M, K}, input.options());
+    run_cublas_gemm(
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        K, M, N,
+        1.0f, 0.0f,
+        weight_c.data_ptr<float>(),      K,   // W[N,K] row-major -> lda=K
+        grad_output_c.data_ptr<float>(), N,   // dY[M,N] row-major -> ldb=N
+        grad_input.data_ptr<float>(),    K,   // dX[M,K] row-major -> ldc=K
+        stream);
+
+    // ---- grad_weight = grad_output^T @ input -> [N, K] ----
+    // Row-major dW[N,K] = col-major [K,N]
+    // dW = dY^T @ X
+    // cuBLAS: C(K,N) = op(A)(K,M) * op(B)(M,N)
+    //   op(A) = X[M,K]_row = [K,M]_col, CUBLAS_OP_N -> (K,M)
+    //   op(B) = dY[M,N]_row = [N,M]_col, CUBLAS_OP_T -> (M,N)
+    auto grad_weight = torch::empty({N, K}, weight.options());
+    run_cublas_gemm(
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        K, N, M,
+        1.0f, 0.0f,
+        input_c.data_ptr<float>(),       K,   // X[M,K] row-major -> lda=K
+        grad_output_c.data_ptr<float>(), N,   // dY[M,N] row-major -> ldb=N
+        grad_weight.data_ptr<float>(),   K,   // dW[N,K] row-major -> ldc=K
         stream);
 
     // ---- grad_bias = sum(grad_output, dim=0) -> [N] ----
