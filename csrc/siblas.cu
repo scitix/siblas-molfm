@@ -57,17 +57,15 @@ using MmaTileShape        = Shape<_256,_128,_16>;
 using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmNN: A = RowMajor, B = ColumnMajor -> C = ColumnMajor
+// GemmNN: A = RowMajor, B = ColumnMajor -> C = RowMajor
 // Used for:
-//   Forward:       Y[M,N] = X[M,K](RowMajor) @ W^T  =>  B = W[N,K] treated as ColMajor[K,N]
-//   Backward dX:   dX[M,K] = dY[M,N](RowMajor) @ W  =>  B = W[N,K] treated as ColMajor[K,N]
-//                   but note: for dX, the GEMM is C[M,K] = A[M,N] * B_col[N,K]
-//                   We must reinterpret: W[N,K] row-major is the same memory layout as W^T[K,N] col-major
+//   Forward: Y[M,N] = X[M,K](RowMajor) @ W^T  =>  B = W[N,K] treated as ColMajor[K,N]
+//   B is implicitly transposed (RowMajor storage read as ColMajor).
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 using LayoutA_NN          = cutlass::layout::RowMajor;
 using LayoutB_NN          = cutlass::layout::ColumnMajor;
-using LayoutC_NN          = cutlass::layout::RowMajor;    // 修复 Bug 1：必须是 RowMajor
+using LayoutC_NN          = cutlass::layout::RowMajor;
 
 using CollectiveEpilogue_NN = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
@@ -140,6 +138,46 @@ using GemmKernel_NT = cutlass::gemm::kernel::GemmUniversal<
     void>;
 
 using GemmNT = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NT>;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GemmRR: A = RowMajor, B = RowMajor -> C = RowMajor
+// Used for:
+//   Backward dX: dX[M,K] = dY[M,N](RowMajor) @ W[N,K](RowMajor)
+//   No implicit transpose on either operand.
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+using LayoutA_RR          = cutlass::layout::RowMajor;
+using LayoutB_RR          = cutlass::layout::RowMajor;
+using LayoutC_RR          = cutlass::layout::RowMajor;
+
+using CollectiveEpilogue_RR = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    MmaTileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementOutput, LayoutC_RR, Alignment,
+    ElementOutput, LayoutC_RR, Alignment,
+    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
+  >::CollectiveOp;
+
+using CollectiveMainloop_RR = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementInput, LayoutA_RR, Alignment,
+    ElementInput, LayoutB_RR, Alignment,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue_RR::SharedStorage))>,
+    MainloopSchedule
+  >::CollectiveOp;
+
+using GemmKernel_RR = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int,int>,
+    CollectiveMainloop_RR,
+    CollectiveEpilogue_RR,
+    void>;
+
+using GemmRR = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_RR>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Stride types
@@ -302,16 +340,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_linear_backward(
 
     // ---- grad_input = grad_output @ W -> [M, K] ----
     // grad_output: [M, N] RowMajor, W: [N, K] RowMajor
-    // This is C[M,K] = A[M,N] * B[N,K]
-    // For GemmNN: A=RowMajor[M,N], B=ColMajor[K,N]
-    //   W[N,K] RowMajor in memory = W^T[K,N] ColMajor ✓
-    // auto grad_input = torch::empty({M, K}, input.options())._zeros();
-    auto grad_input = torch::empty({M, K}, input.options()).zero_();
-    run_cutlass_gemm<GemmNN>(
+    // This is C[M,K] = A[M,N] * B[N,K]  (no transpose on either operand)
+    // GemmRR: A=RowMajor, B=RowMajor -> C=RowMajor
+    auto grad_input = torch::empty({M, K}, input.options());
+    run_cutlass_gemm<GemmRR>(
         M, K, N,      // GEMM dimensions: M, N_out=K, K_inner=N
         1.0f, 0.0f,
         grad_output_c.data_ptr<float>(),   // A [M, N] RowMajor
-        weight_c.data_ptr<float>(),        // B [N, K] RowMajor = [K, N] ColMajor
+        weight_c.data_ptr<float>(),        // B [N, K] RowMajor
         grad_input.data_ptr<float>(),
         grad_input.data_ptr<float>(),
         stream);

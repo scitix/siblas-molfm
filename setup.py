@@ -1,8 +1,8 @@
 import os
 import subprocess
 from setuptools import setup
+import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
 # CUTLASS version to use
 CUTLASS_VERSION = "v4.4.1"
 CUTLASS_REPO = "https://github.com/NVIDIA/cutlass.git"

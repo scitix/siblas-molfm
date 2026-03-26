@@ -230,6 +230,89 @@ def test_against_nn_linear():
     print("  PASSED\n")
 
 
+def test_precision_comparison():
+    """Compare siblas (BF16x6) vs TF32 vs FP32, all against FP64 ground truth."""
+    print("=" * 60)
+    print("Test 7: Precision comparison (BF16x6 vs TF32 vs FP32) against FP64")
+    print("=" * 60)
+
+    torch.manual_seed(42)
+    M, N, K = 128, 256, 256
+
+    X = torch.randn(M, K, device="cuda", dtype=torch.float32)
+    W = torch.randn(N, K, device="cuda", dtype=torch.float32)
+    b = torch.randn(N, device="cuda", dtype=torch.float32)
+
+    # ---- Ground truth: FP64 ----
+    ref_fp64 = F.linear(X.double(), W.double(), b.double())
+    ref = ref_fp64.float()
+
+    # ---- siblas (BF16x6 emulated FP32) ----
+    out_siblas = linear_forward(X, W, b)
+
+    # ---- PyTorch FP32 (exact, TF32 disabled globally) ----
+    out_fp32 = F.linear(X, W, b)
+
+    # ---- PyTorch TF32 ----
+    torch.backends.cuda.matmul.allow_tf32 = True
+    out_tf32 = F.linear(X, W, b)
+    torch.backends.cuda.matmul.allow_tf32 = False  # restore
+
+    # ---- Forward comparison ----
+    print("\n  [Forward] max_abs / mean_abs vs FP64 ground truth:")
+    for label, out in [
+        ("BF16x6 (siblas)", out_siblas),
+        ("TF32   (PyTorch)", out_tf32),
+        ("FP32   (PyTorch)", out_fp32),
+    ]:
+        diff = (out - ref).abs()
+        print(f"    {label}:  max={diff.max().item():.6e}  mean={diff.mean().item():.6e}")
+
+    # ---- Backward comparison ----
+    print("\n  [Backward] grad_input / grad_weight / grad_bias max_abs vs FP64:")
+
+    grad_out_fp32 = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    grad_out_fp64 = grad_out_fp32.double()
+
+    # FP64 reference backward
+    X_ref = X.double().requires_grad_(True)
+    W_ref = W.double().requires_grad_(True)
+    b_ref = b.double().requires_grad_(True)
+    F.linear(X_ref, W_ref, b_ref).backward(grad_out_fp64)
+
+    def run_backward(label, forward_fn):
+        x = X.clone().requires_grad_(True)
+        w = W.clone().requires_grad_(True)
+        bb = b.clone().requires_grad_(True)
+        out = forward_fn(x, w, bb)
+        out.backward(grad_out_fp32)
+        print(f"    {label}:")
+        for gname, ours, theirs_fp64 in [
+            ("grad_input ", x.grad, X_ref.grad),
+            ("grad_weight", w.grad, W_ref.grad),
+            ("grad_bias  ", bb.grad, b_ref.grad),
+        ]:
+            diff = (ours - theirs_fp64.float()).abs()
+            print(f"      {gname}:  max={diff.max().item():.6e}  mean={diff.mean().item():.6e}")
+
+    # siblas backward
+    run_backward("BF16x6 (siblas)", lambda x, w, bb: linear_forward(x, w, bb))
+
+    # TF32 backward
+    def tf32_linear(x, w, bb):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        out = F.linear(x, w, bb)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        return out
+
+    run_backward("TF32   (PyTorch)", tf32_linear)
+
+    # FP32 backward
+    run_backward("FP32   (PyTorch)", lambda x, w, bb: F.linear(x, w, bb))
+
+    print("\n  DONE\n")
+
+
 if __name__ == "__main__":
     print("siblas test suite (FP64 Ground Truth Mode)")
     print("=" * 60)
@@ -244,5 +327,6 @@ if __name__ == "__main__":
     test_module()
     test_batched()
     test_against_nn_linear()
+    test_precision_comparison()
 
     print("All tests passed!")
