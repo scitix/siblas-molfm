@@ -3,41 +3,21 @@ import subprocess
 from setuptools import setup
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-# CUTLASS version to use
-CUTLASS_VERSION = "v4.4.1"
-CUTLASS_REPO = "https://github.com/NVIDIA/cutlass.git"
 
-# Use relative path for CUTLASS directory (setuptools requires relative paths)
-CUTLASS_REL_DIR = "/volume/code/jjcheng/cutlass"
-
-
-def ensure_cutlass():
-    """Download CUTLASS if not already present."""
-    abs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), CUTLASS_REL_DIR)
-    if os.path.isfile(os.path.join(abs_dir, "include", "cutlass", "cutlass.h")):
-        return  # Already available
-
-    print(f"[siblas] Downloading CUTLASS {CUTLASS_VERSION} ...")
-    os.makedirs(os.path.dirname(abs_dir), exist_ok=True)
-
-    # Shallow clone with single branch for speed
-    subprocess.check_call([
-        "git", "clone",
-        "--depth", "1",
-        "--branch", CUTLASS_VERSION,
-        CUTLASS_REPO,
-        abs_dir,
-    ])
-    print(f"[siblas] CUTLASS downloaded to {abs_dir}")
+# Optimized CUTLASS from gemm_bf16x9 (persistent-B BF16x6 kernel)
+CUTLASS_DIR = "/volume/code/chengjiajun/gemm_bf16x9/third_party/cutlass"
 
 
 def get_cuda_extensions():
-    ensure_cutlass()
+    cutlass_include = os.path.join(CUTLASS_DIR, "include")
+    cutlass_util_include = os.path.join(CUTLASS_DIR, "tools", "util", "include")
 
-    # include_dirs must be absolute paths for nvcc to find headers correctly
-    abs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), CUTLASS_REL_DIR)
-    cutlass_include = os.path.join(abs_dir, "include")
-    cutlass_util_include = os.path.join(abs_dir, "tools", "util", "include")
+    if not os.path.isfile(os.path.join(cutlass_include, "cutlass", "cutlass.h")):
+        raise RuntimeError(
+            f"CUTLASS not found at {cutlass_include}. "
+            "Expected the gemm_bf16x9 third_party/cutlass tree."
+        )
+
     sources = [
         os.path.join("csrc", "siblas.cu"),
         os.path.join("csrc", "torch_binding.cu"),
@@ -49,6 +29,7 @@ def get_cuda_extensions():
         include_dirs=[
             cutlass_include,
             cutlass_util_include,
+            os.path.abspath("csrc"),  # for sm100_mma_warpspecialized_emulated_optimized.hpp
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
@@ -59,6 +40,9 @@ def get_cuda_extensions():
                 "-gencode=arch=compute_100a,code=sm_100a",
                 "--threads=4",
                 "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
+                "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+                "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+                "--expt-relaxed-constexpr",
             ],
         },
         libraries=["cublas"],
@@ -69,7 +53,7 @@ def get_cuda_extensions():
 setup(
     name="siblas",
     version="0.2.0",
-    description="GEMM interface for linear layers with CUTLASS BF16x6 emulated FP32 (Blackwell SM100)",
+    description="GEMM interface for linear layers with CUTLASS BF16x6 optimized persistent-B kernel (Blackwell SM100)",
     packages=["siblas"],
     ext_modules=get_cuda_extensions(),
     cmdclass={"build_ext": BuildExtension},

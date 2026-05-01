@@ -20,7 +20,10 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_emulated_optimized.hpp"
+#include "cutlass/epilogue/fusion/operations.hpp"
+
+// Optimized SM100 BF16x6 persistent-B mainloop kernel
+#include "sm100_mma_warpspecialized_emulated_optimized.hpp"
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
@@ -35,11 +38,17 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// CUTLASS BF16x6 emulated FP32 GEMM kernel configurations
-/// Based on CUTLASS example 78b (Blackwell SM100)
+/// Uses optimized persistent-B mainloop (MainloopSm100TmaUmmaWarpSpecializedFastF32PersistentB)
 ///
-/// We define two GEMM kernel types:
-///   GemmNN: A=RowMajor,   B=ColumnMajor  (used for forward Y=X@W^T and backward dX=dY@W)
-///   GemmNT: A=RowMajor,   B=RowMajor     (used for backward dW=dY^T@X)
+/// Output layout is ColumnMajor (CUTLASS SM100 native). PyTorch wrappers handle the
+/// row-major ↔ column-major reinterpretation via transposed GEMM calls.
+///
+///   GemmNN: A=RowMajor, B=ColumnMajor, C=ColumnMajor
+///     Forward: Y=X@W^T   (A=X[M,K], B=W[N,K] as ColMajor = W^T, D=Y[M,N] ColMajor)
+///   GemmNT: A=ColumnMajor, B=RowMajor, C=ColumnMajor
+///     Backward dW: dW=dY^T@X  (A=dY[M,N] ColMajor = dY^T[N,M], B=X[M,K], D=dW[N,K])
+///   GemmRR: A=RowMajor, B=RowMajor, C=ColumnMajor
+///     Backward dX: dX=dY@W  (A=dY[M,N], B=W[N,K], D=dX[M,K] ColMajor)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Common configuration
@@ -52,147 +61,92 @@ constexpr int Alignment   = 128 / cutlass::sizeof_bits<float>::value;  // = 4
 
 // Kernel perf config
 using ClusterShape        = Shape<_2,_1,_1>;
-using MmaTileShape        = Shape<_256,_128,_16>;
+using MmaTileShape        = Shape<_256,_64,_32>;
 
-// Schedule for BF16x6 emulated GEMM (non-Smem variant: A operand in TMEM)
-using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100;
+// Persistent-B carveout (matches bench_gemm.cu calculation)
+constexpr int NumBands    = 3;
+constexpr int MaxPBTiles  = 8;
+constexpr int PBCarveout  =
+    (int(get<1>(MmaTileShape{})) / int(get<0>(ClusterShape{}))) *
+    int(get<2>(MmaTileShape{})) *
+    int(sizeof(cutlass::bfloat16_t)) * NumBands * MaxPBTiles + 1024 + 64;
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmNN: A = RowMajor, B = ColumnMajor -> C = RowMajor
-// Used for:
-//   Forward: Y[M,N] = X[M,K](RowMajor) @ W^T  =>  B = W[N,K] treated as ColMajor[K,N]
-//   B is implicitly transposed (RowMajor storage read as ColMajor).
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-using LayoutA_NN          = cutlass::layout::RowMajor;
-using LayoutB_NN          = cutlass::layout::ColumnMajor;
-using LayoutC_NN          = cutlass::layout::RowMajor;
-
-using CollectiveEpilogue_NN = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    MmaTileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementOutput, LayoutC_NN, Alignment,
-    ElementOutput, LayoutC_NN, Alignment,
-    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
-  >::CollectiveOp;
-
-using CollectiveMainloop_NN = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementInput, LayoutA_NN, Alignment,
-    ElementInput, LayoutB_NN, Alignment,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue_NN::SharedStorage))>,
-    MainloopSchedule
-  >::CollectiveOp;
-
-using GemmKernel_NN = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>,
-    CollectiveMainloop_NN,
-    CollectiveEpilogue_NN,
-    void>;
-
-using GemmNN = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NN>;
+// All output layouts are ColumnMajor (SM100 native)
+using LayoutOut = cutlass::layout::ColumnMajor;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmNT: A = RowMajor, B = RowMajor -> C = ColumnMajor
-// Used for:
-//   Backward dW: dW[N,K] = dY^T[N,M] @ X[M,K]
-//   We compute: C[N,K] = dY^T @ X
-//   In CUTLASS terms: A = dY viewed as ColMajor (to get dY^T as RowMajor), B = X RowMajor
-//   Actually simpler: use A=ColumnMajor for dY[M,N] (gives us dY^T[N,M] in row-major sense)
-//                     B=RowMajor for X[M,K]
+// Build the optimized persistent-B policy from a standard builder
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-using LayoutA_NT          = cutlass::layout::ColumnMajor;  // dY[M,N] col-major = dY^T[N,M] row-major
-using LayoutB_NT          = cutlass::layout::RowMajor;
-using LayoutC_NT          = cutlass::layout::RowMajor;
+// Helper: build OptPolicy for a given A/B layout pair
+template <typename LayoutA, typename LayoutB>
+struct MakeGemm {
+    using EpiTmp = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        MmaTileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator,
+        ElementOutput, LayoutOut, Alignment,
+        ElementOutput, LayoutOut, Alignment,
+        cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
+    >::CollectiveOp;
 
-using CollectiveEpilogue_NT = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    MmaTileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementOutput, LayoutC_NT, Alignment,
-    ElementOutput, LayoutC_NT, Alignment,
-    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
-  >::CollectiveOp;
+    using StdBuilder = cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ElementInput, LayoutA, Alignment,
+        ElementInput, LayoutB, Alignment,
+        ElementAccumulator,
+        MmaTileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename EpiTmp::SharedStorage)) + PBCarveout>,
+        cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100
+    >;
 
-using CollectiveMainloop_NT = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementInput, LayoutA_NT, Alignment,
-    ElementInput, LayoutB_NT, Alignment,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue_NT::SharedStorage))>,
-    MainloopSchedule
-  >::CollectiveOp;
+    using OptPolicy = cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedFastF32PersistentB<
+        4, 6,
+        StdBuilder::SchedulerPipelineStageCount,
+        StdBuilder::AccumulatorPipelineStageCount,
+        NumBands,
+        StdBuilder::ScalingFactor,
+        StdBuilder::AccPromotionInterval,
+        ClusterShape,
+        typename StdBuilder::AccumulatorCopyAtom
+    >;
 
-using GemmKernel_NT = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>,
-    CollectiveMainloop_NT,
-    CollectiveEpilogue_NT,
-    void>;
+    using Mainloop = cutlass::gemm::collective::CollectiveMma<
+        OptPolicy, MmaTileShape, ElementInput,
+        cutlass::gemm::TagToStrideA_t<LayoutA>, ElementInput,
+        cutlass::gemm::TagToStrideB_t<LayoutB>,
+        typename StdBuilder::TiledMma,
+        typename StdBuilder::GmemTiledCopyA, typename StdBuilder::SmemLayoutAtomPairA,
+        typename StdBuilder::CopyAtomPairA, cute::identity,
+        typename StdBuilder::GmemTiledCopyB, typename StdBuilder::SmemLayoutAtomPairB,
+        typename StdBuilder::CopyAtomPairB, cute::identity
+    >;
 
-using GemmNT = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NT>;
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        MmaTileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator,
+        ElementOutput, LayoutOut, Alignment,
+        ElementOutput, LayoutOut, Alignment,
+        cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
+    >::CollectiveOp;
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmRR: A = RowMajor, B = RowMajor -> C = RowMajor
-// Used for:
-//   Backward dX: dX[M,K] = dY[M,N](RowMajor) @ W[N,K](RowMajor)
-//   No implicit transpose on either operand.
-/////////////////////////////////////////////////////////////////////////////////////////////////
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int,int,int,int>, Mainloop, Epilogue, void>;
+    using Type = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
 
-using LayoutA_RR          = cutlass::layout::RowMajor;
-using LayoutB_RR          = cutlass::layout::RowMajor;
-using LayoutC_RR          = cutlass::layout::RowMajor;
+// GemmNN: A=RowMajor, B=ColumnMajor  (forward: Y=X@W^T)
+using GemmNN = MakeGemm<cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::Type;
 
-using CollectiveEpilogue_RR = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    MmaTileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementOutput, LayoutC_RR, Alignment,
-    ElementOutput, LayoutC_RR, Alignment,
-    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
-  >::CollectiveOp;
+// GemmNT: A=ColumnMajor, B=RowMajor  (backward dW: dW=dY^T@X)
+using GemmNT = MakeGemm<cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>::Type;
 
-using CollectiveMainloop_RR = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementInput, LayoutA_RR, Alignment,
-    ElementInput, LayoutB_RR, Alignment,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue_RR::SharedStorage))>,
-    MainloopSchedule
-  >::CollectiveOp;
-
-using GemmKernel_RR = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>,
-    CollectiveMainloop_RR,
-    CollectiveEpilogue_RR,
-    void>;
-
-using GemmRR = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_RR>;
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-// Stride types
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-using StrideA_NN = typename GemmNN::GemmKernel::StrideA;
-using StrideB_NN = typename GemmNN::GemmKernel::StrideB;
-using StrideC_NN = typename GemmNN::GemmKernel::StrideC;
-using StrideD_NN = typename GemmNN::GemmKernel::StrideD;
-
-using StrideA_NT = typename GemmNT::GemmKernel::StrideA;
-using StrideB_NT = typename GemmNT::GemmKernel::StrideB;
-using StrideC_NT = typename GemmNT::GemmKernel::StrideC;
-using StrideD_NT = typename GemmNT::GemmKernel::StrideD;
+// GemmRR: A=RowMajor, B=RowMajor  (backward dX: dX=dY@W)
+using GemmRR = MakeGemm<cutlass::layout::RowMajor, cutlass::layout::RowMajor>::Type;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Helper: run a CUTLASS GEMM
@@ -215,6 +169,7 @@ void run_cutlass_gemm(
 
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    // Output is ColumnMajor[M,N]: outer dim is N, inner dim is M
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 
@@ -286,21 +241,25 @@ torch::Tensor siblas_linear_forward(
     auto input_c = input.contiguous();
     auto weight_c = weight.contiguous();
 
-    // Allocate output [M, N]
-    auto output = torch::empty({M, N}, input.options());
+    // Allocate output [M, N] as column-major (CUTLASS SM100 native output layout).
+    // col-major [M,N] = row-major [N,M], so we allocate [N,M] and transpose the view.
+    auto output_cm = torch::empty({N, M}, input.options());
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // Y = X @ W^T using CUTLASS BF16x6 emulated FP32
-    // GemmNN: A[M,K]=RowMajor, B[N,K]=RowMajor-as-ColMajor, C/D[M,N]=ColMajor
+    // Y = X @ W^T using CUTLASS BF16x6 optimized persistent-B kernel
+    // GemmNN: A[M,K]=RowMajor, B[N,K]=RowMajor-as-ColMajor, D[M,N]=ColMajor
     run_cutlass_gemm<GemmNN>(
         M, N, K,
         1.0f, 0.0f,
         input_c.data_ptr<float>(),
         weight_c.data_ptr<float>(),
-        output.data_ptr<float>(),   // C (unused with beta=0)
-        output.data_ptr<float>(),   // D
+        output_cm.data_ptr<float>(),   // C (unused with beta=0)
+        output_cm.data_ptr<float>(),   // D (col-major [M,N] stored as [N,M] row-major)
         stream);
+
+    // Reinterpret col-major [M,N] buffer as row-major [M,N] via transpose
+    auto output = output_cm.t().contiguous();
 
     // Add bias if provided
     if (bias.defined() && bias.numel() > 0) {
@@ -340,33 +299,30 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_linear_backward(
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     // ---- grad_input = grad_output @ W -> [M, K] ----
-    // grad_output: [M, N] RowMajor, W: [N, K] RowMajor
-    // This is C[M,K] = A[M,N] * B[N,K]  (no transpose on either operand)
-    // GemmRR: A=RowMajor, B=RowMajor -> C=RowMajor
-    auto grad_input = torch::empty({M, K}, input.options());
+    // GemmRR: A=dY[M,N] RowMajor, B=W[N,K] RowMajor -> D=dX[M,K] ColMajor
+    auto grad_input_cm = torch::empty({K, M}, input.options());
     run_cutlass_gemm<GemmRR>(
-        M, K, N,      // GEMM dimensions: M, N_out=K, K_inner=N
+        M, K, N,      // GEMM dims: M, N_out=K, K_inner=N
         1.0f, 0.0f,
         grad_output_c.data_ptr<float>(),   // A [M, N] RowMajor
         weight_c.data_ptr<float>(),        // B [N, K] RowMajor
-        grad_input.data_ptr<float>(),
-        grad_input.data_ptr<float>(),
+        grad_input_cm.data_ptr<float>(),
+        grad_input_cm.data_ptr<float>(),
         stream);
+    auto grad_input = grad_input_cm.t().contiguous();
 
     // ---- grad_weight = grad_output^T @ input -> [N, K] ----
-    // grad_output^T: [N, M], input: [M, K]
-    // This is C[N,K] = A^T[N,M] * B[M,K]
-    // For GemmNT: A=ColMajor (dY[M,N] stored col-major = dY^T[N,M] row-major),
-    //             B=RowMajor (X[M,K])
-    auto grad_weight = torch::empty({N, K}, weight.options()).zero_();
+    // GemmNT: A=dY[M,N] ColMajor (= dY^T[N,M]), B=X[M,K] RowMajor -> D=dW[N,K] ColMajor
+    auto grad_weight_cm = torch::empty({K, N}, weight.options());
     run_cutlass_gemm<GemmNT>(
-        N, K, M,      // GEMM dimensions: M_out=N, N_out=K, K_inner=M
+        N, K, M,      // GEMM dims: M_out=N, N_out=K, K_inner=M
         1.0f, 0.0f,
         grad_output_c.data_ptr<float>(),   // A: dY[M,N] treated as ColMajor -> dY^T[N,M]
         input_c.data_ptr<float>(),         // B: X[M,K] RowMajor
-        grad_weight.data_ptr<float>(),
-        grad_weight.data_ptr<float>(),
+        grad_weight_cm.data_ptr<float>(),
+        grad_weight_cm.data_ptr<float>(),
         stream);
+    auto grad_weight = grad_weight_cm.t().contiguous();
 
     // ---- grad_bias = sum(grad_output, dim=0) -> [N] ----
     auto grad_bias = grad_output.sum(0);
