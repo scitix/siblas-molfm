@@ -61,7 +61,7 @@ def get_cuda_extensions():
                 "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
             ],
         },
-        libraries=["cublas"],
+        libraries=["cublas", "cublasLt"],
     )
     return [ext]
 

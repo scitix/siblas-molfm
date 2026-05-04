@@ -2,8 +2,9 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h> // 必须 include 这个头文件
+#include <c10/cuda/CUDAGuard.h>
 
 #include <stdexcept>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/epilogue/fusion/operations.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -22,14 +24,7 @@
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/gemm/collective/sm100_mma_warpspecialized_emulated_optimized.hpp"
 
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/reference/device/tensor_fill.h"
 
 using namespace cute;
 
@@ -37,37 +32,53 @@ using namespace cute;
 /// CUTLASS BF16x6 emulated FP32 GEMM kernel configurations
 /// Based on CUTLASS example 78b (Blackwell SM100)
 ///
-/// We define two GEMM kernel types:
-///   GemmNN: A=RowMajor,   B=ColumnMajor  (used for forward Y=X@W^T and backward dX=dY@W)
-///   GemmNT: A=RowMajor,   B=RowMajor     (used for backward dW=dY^T@X)
+/// GemmNN:   A=RowMajor, B=ColMajor  -> forward Y=X@W^T (with fused bias)
+/// GemmNT:   A=ColMajor, B=RowMajor  -> backward dW=dY^T@X
+/// GemmRR:   A=RowMajor, B=RowMajor  -> backward dX=dY@W
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Common configuration
 using ElementInput        = float;
 using ElementOutput       = float;
 using ElementAccumulator  = float;
 using ArchTag             = cutlass::arch::Sm100;
 using OperatorClass       = cutlass::arch::OpClassTensorOp;
-constexpr int Alignment   = 128 / cutlass::sizeof_bits<float>::value;  // = 4
+constexpr int Alignment   = 128 / cutlass::sizeof_bits<float>::value;  // 4
 
-// Kernel perf config
 using ClusterShape        = Shape<_2,_1,_1>;
 using MmaTileShape        = Shape<_256,_128,_16>;
 
-// Schedule for BF16x6 emulated GEMM (non-Smem variant: A operand in TMEM)
-using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100;
+using MainloopSchedule    = cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100;
+
+// Fused bias epilogue operation: D = alpha * acc + beta * C + row-bias
+using FusedBiasOp = cutlass::epilogue::fusion::LinCombPerRowBias<
+    float,   // ElementOutput
+    float,   // ElementCompute
+    float,   // ElementBias
+    float,   // ElementSource (C)
+    float,   // ElementScalar
+    Alignment>;  // AlignmentBias
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmNN: A = RowMajor, B = ColumnMajor -> C = RowMajor
-// Used for:
-//   Forward: Y[M,N] = X[M,K](RowMajor) @ W^T  =>  B = W[N,K] treated as ColMajor[K,N]
-//   B is implicitly transposed (RowMajor storage read as ColMajor).
+// GemmNN_Bias: A=RowMajor, B=ColMajor -> C=RowMajor  (forward, fused bias)
+// D = alpha * X @ W^T + bias[n]
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 using LayoutA_NN          = cutlass::layout::RowMajor;
 using LayoutB_NN          = cutlass::layout::ColumnMajor;
 using LayoutC_NN          = cutlass::layout::RowMajor;
 
+using CollectiveEpilogue_NN_Bias = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    MmaTileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementOutput, LayoutC_NN, Alignment,
+    ElementOutput, LayoutC_NN, Alignment,
+    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm,
+    FusedBiasOp
+  >::CollectiveOp;
+
+// Plain epilogue (no bias, used when bias is nullptr — e.g. no-bias forward)
 using CollectiveEpilogue_NN = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     MmaTileShape, ClusterShape,
@@ -89,25 +100,26 @@ using CollectiveMainloop_NN = typename cutlass::gemm::collective::CollectiveBuil
     MainloopSchedule
   >::CollectiveOp;
 
+using GemmKernel_NN_Bias = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int,int>,
+    CollectiveMainloop_NN,
+    CollectiveEpilogue_NN_Bias,
+    void>;
+
 using GemmKernel_NN = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>,
     CollectiveMainloop_NN,
     CollectiveEpilogue_NN,
     void>;
 
-using GemmNN = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NN>;
+using GemmNN_Bias = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NN_Bias>;
+using GemmNN      = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NN>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmNT: A = RowMajor, B = RowMajor -> C = ColumnMajor
-// Used for:
-//   Backward dW: dW[N,K] = dY^T[N,M] @ X[M,K]
-//   We compute: C[N,K] = dY^T @ X
-//   In CUTLASS terms: A = dY viewed as ColMajor (to get dY^T as RowMajor), B = X RowMajor
-//   Actually simpler: use A=ColumnMajor for dY[M,N] (gives us dY^T[N,M] in row-major sense)
-//                     B=RowMajor for X[M,K]
+// GemmNT: A=ColMajor, B=RowMajor -> C=RowMajor  (backward dW = dY^T @ X)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-using LayoutA_NT          = cutlass::layout::ColumnMajor;  // dY[M,N] col-major = dY^T[N,M] row-major
+using LayoutA_NT          = cutlass::layout::ColumnMajor;
 using LayoutB_NT          = cutlass::layout::RowMajor;
 using LayoutC_NT          = cutlass::layout::RowMajor;
 
@@ -141,10 +153,7 @@ using GemmKernel_NT = cutlass::gemm::kernel::GemmUniversal<
 using GemmNT = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_NT>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmRR: A = RowMajor, B = RowMajor -> C = RowMajor
-// Used for:
-//   Backward dX: dX[M,K] = dY[M,N](RowMajor) @ W[N,K](RowMajor)
-//   No implicit transpose on either operand.
+// GemmRR: A=RowMajor, B=RowMajor -> C=RowMajor  (backward dX = dY @ W)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 using LayoutA_RR          = cutlass::layout::RowMajor;
@@ -180,6 +189,7 @@ using GemmKernel_RR = cutlass::gemm::kernel::GemmUniversal<
 
 using GemmRR = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel_RR>;
 
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Stride types
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -195,7 +205,7 @@ using StrideC_NT = typename GemmNT::GemmKernel::StrideC;
 using StrideD_NT = typename GemmNT::GemmKernel::StrideD;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Helper: run a CUTLASS GEMM
+// Helpers: run CUTLASS GEMM (plain) and run CUTLASS GEMM with fused row-bias
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace {
@@ -226,44 +236,82 @@ void run_cutlass_gemm(
     };
 
     GemmType gemm;
-
     size_t workspace_size = GemmType::get_workspace_size(arguments);
-    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)}, 
+    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
                               torch::TensorOptions().device(torch::kCUDA).dtype(torch::kUInt8));
     cutlass::Status status;
 
     status = gemm.can_implement(arguments);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error(
-            std::string("CUTLASS GEMM can_implement failed: ") +
-            cutlass::cutlassGetStatusString(status));
-    }
+    if (status != cutlass::Status::kSuccess)
+        throw std::runtime_error(std::string("CUTLASS can_implement: ") + cutlass::cutlassGetStatusString(status));
 
     status = gemm.initialize(arguments, workspace.data_ptr(), stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error(
-            std::string("CUTLASS GEMM initialize failed: ") +
-            cutlass::cutlassGetStatusString(status));
-    }
+    if (status != cutlass::Status::kSuccess)
+        throw std::runtime_error(std::string("CUTLASS initialize: ") + cutlass::cutlassGetStatusString(status));
 
     status = gemm.run(stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error(
-            std::string("CUTLASS GEMM run failed: ") +
-            cutlass::cutlassGetStatusString(status));
-    }
+    if (status != cutlass::Status::kSuccess)
+        throw std::runtime_error(std::string("CUTLASS run: ") + cutlass::cutlassGetStatusString(status));
+}
+
+// Forward with fused per-row bias: D = alpha * A*B + bias[n]  (beta*C term disabled / C=nullptr)
+void run_cutlass_gemm_bias(
+    int M, int N, int K,
+    const float* A, const float* B,
+    const float* bias,
+    float* D,
+    cudaStream_t stream) {
+
+    using GemmType = GemmNN_Bias;
+    using StrideA  = typename GemmType::GemmKernel::StrideA;
+    using StrideB  = typename GemmType::GemmKernel::StrideB;
+    using StrideD  = typename GemmType::GemmKernel::StrideD;
+
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+
+    // Build epilogue args using the FusionCallbacks::Arguments struct
+    using EpilogueArgs = typename GemmType::GemmKernel::CollectiveEpilogue::FusionCallbacks::Arguments;
+    EpilogueArgs epi_args{};
+    epi_args.alpha    = 1.0f;
+    epi_args.beta     = 0.0f;
+    epi_args.bias_ptr = bias;   // per-row bias pointer [N]
+
+    typename GemmType::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {A, stride_A, B, stride_B},
+        {epi_args, nullptr /*C unused, beta=0*/, {}, D, stride_D}
+    };
+
+    GemmType gemm;
+    size_t workspace_size = GemmType::get_workspace_size(arguments);
+    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
+                              torch::TensorOptions().device(torch::kCUDA).dtype(torch::kUInt8));
+    cutlass::Status status;
+
+    status = gemm.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess)
+        throw std::runtime_error(std::string("CUTLASS bias can_implement: ") + cutlass::cutlassGetStatusString(status));
+
+    status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+    if (status != cutlass::Status::kSuccess)
+        throw std::runtime_error(std::string("CUTLASS bias initialize: ") + cutlass::cutlassGetStatusString(status));
+
+    status = gemm.run(stream);
+    if (status != cutlass::Status::kSuccess)
+        throw std::runtime_error(std::string("CUTLASS bias run: ") + cutlass::cutlassGetStatusString(status));
 }
 
 }  // namespace
+
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Forward: Y = X @ W^T + bias
 // X: [M, K] RowMajor, W: [N, K] RowMajor, bias: [N] -> Y: [M, N]
 //
-// CUTLASS GEMM (GemmNN):
-//   A = X [M, K] RowMajor
-//   B = W [N, K] RowMajor memory = [K, N] ColumnMajor
-//   C = Y [M, N] (output, ColumnMajor for CUTLASS)
+// Bias is fused into the CUTLASS epilogue (one kernel, no extra add_ pass).
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 torch::Tensor siblas_linear_forward(
@@ -283,31 +331,36 @@ torch::Tensor siblas_linear_forward(
     TORCH_CHECK(weight.size(1) == K,
                 "weight K dimension mismatch: expected ", K, " got ", weight.size(1));
 
-    auto input_c = input.contiguous();
+    auto input_c  = input.contiguous();
     auto weight_c = weight.contiguous();
-
-    // Allocate output [M, N]
-    auto output = torch::empty({M, N}, input.options());
+    auto output   = torch::empty({M, N}, input.options());
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // Y = X @ W^T using CUTLASS BF16x6 emulated FP32
-    // GemmNN: A[M,K]=RowMajor, B[N,K]=RowMajor-as-ColMajor, C/D[M,N]=ColMajor
-    run_cutlass_gemm<GemmNN>(
-        M, N, K,
-        1.0f, 0.0f,
-        input_c.data_ptr<float>(),
-        weight_c.data_ptr<float>(),
-        output.data_ptr<float>(),   // C (unused with beta=0)
-        output.data_ptr<float>(),   // D
-        stream);
-
-    // Add bias if provided
-    if (bias.defined() && bias.numel() > 0) {
+    const bool has_bias = bias.defined() && bias.numel() > 0;
+    if (has_bias) {
         TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
         TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
         TORCH_CHECK(bias.size(0) == N, "bias size mismatch");
-        output.add_(bias.unsqueeze(0));
+        auto bias_c = bias.contiguous();
+        // Single kernel: GEMM + bias fused in epilogue
+        run_cutlass_gemm_bias(
+            M, N, K,
+            input_c.data_ptr<float>(),
+            weight_c.data_ptr<float>(),
+            bias_c.data_ptr<float>(),
+            output.data_ptr<float>(),
+            stream);
+    } else {
+        // No bias: plain GEMM
+        run_cutlass_gemm<GemmNN>(
+            M, N, K,
+            1.0f, 0.0f,
+            input_c.data_ptr<float>(),
+            weight_c.data_ptr<float>(),
+            output.data_ptr<float>(),
+            output.data_ptr<float>(),
+            stream);
     }
 
     return output;
@@ -375,72 +428,125 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_linear_backward(
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-/// cuBLAS TF32 Linear implementation
-/// Uses cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 for TF32 Tensor Core acceleration.
+/// cuBLAS LT FP32 Linear implementation with fused bias
+///
+/// Uses cublasLtMatmul (TF32 Tensor Core) with CUBLASLT_MATMUL_DESC_BIAS_POINTER
+/// so the bias addition is fused inside the GEMM kernel — no separate add_ kernel.
 ///
 /// Row-major PyTorch tensors in cuBLAS column-major convention:
-///   PyTorch X[M,K] row-major  = cuBLAS X[K,M] col-major
-///   PyTorch W[N,K] row-major  = cuBLAS W[K,N] col-major
-///   PyTorch Y[M,N] row-major  = cuBLAS Y[N,M] col-major
-///
-///   Y = X @ W^T  =>  cuBLAS: Y[N,M] = W[N,K] @ X[K,M]
-///   i.e. cublasGemmEx(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, W, X, Y)
+///   Y = X @ W^T   =>   cuBLAS: Y[N,M] = W[N,K](T) @ X[K,M](N)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace {
 
-// Thread-safe cuBLAS handle singleton
-cublasHandle_t get_cublas_handle() {
-    static cublasHandle_t handle = nullptr;
-    static std::once_flag flag;
-    std::call_once(flag, []() {
-        cublasStatus_t st = cublasCreate(&handle);
-        if (st != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("cublasCreate failed");
-        }
-        // Set math mode to TF32
-        cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-    });
-    return handle;
+struct CublasLtState {
+    cublasLtHandle_t handle = nullptr;
+
+    CublasLtState() {
+        if (cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("cublasLtCreate failed");
+    }
+    ~CublasLtState() {
+        if (handle) cublasLtDestroy(handle);
+    }
+};
+
+cublasLtHandle_t get_cublaslt_handle() {
+    static CublasLtState state;
+    return state.handle;
 }
 
-// Helper: run a cuBLAS GEMM with TF32
-// C[m, n] = alpha * op(A)[m, k] @ op(B)[k, n] + beta * C[m, n]
-// All dimensions are in cuBLAS column-major convention.
-void run_cublas_gemm(
-    cublasOperation_t transa, cublasOperation_t transb,
+// cuBLAS LT: C[m,n] = alpha * op(A)[m,k] @ op(B)[k,n] + beta*C + bias[m]
+// bias_ptr: column-major bias, length = m (i.e., N in our linear layer)
+void run_cublaslt_gemm_bias(
     int m, int n, int k,
     float alpha, float beta,
-    const float* A, int lda,
-    const float* B, int ldb,
+    const float* A, int lda, cublasOperation_t opA,
+    const float* B, int ldb, cublasOperation_t opB,
     float* C, int ldc,
+    const float* bias_ptr,
     cudaStream_t stream) {
 
-    cublasHandle_t handle = get_cublas_handle();
-    cublasSetStream(handle, stream);
+    cublasLtHandle_t lt = get_cublaslt_handle();
 
-    cublasStatus_t st = cublasGemmEx(
-        handle,
-        transa, transb,
-        m, n, k,
-        &alpha,
-        A, CUDA_R_32F, lda,
-        B, CUDA_R_32F, ldb,
-        &beta,
-        C, CUDA_R_32F, ldc,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasLtMatmulDesc_t   matmul_desc = nullptr;
+    cublasLtMatrixLayout_t layout_A    = nullptr;
+    cublasLtMatrixLayout_t layout_B    = nullptr;
+    cublasLtMatrixLayout_t layout_C    = nullptr;
+    cublasLtMatmulPreference_t pref    = nullptr;
 
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            std::string("cuBLAS GemmEx failed with status ") + std::to_string(st));
+    auto cleanup = [&]() {
+        if (pref)        cublasLtMatmulPreferenceDestroy(pref);
+        if (layout_C)    cublasLtMatrixLayoutDestroy(layout_C);
+        if (layout_B)    cublasLtMatrixLayoutDestroy(layout_B);
+        if (layout_A)    cublasLtMatrixLayoutDestroy(layout_A);
+        if (matmul_desc) cublasLtMatmulDescDestroy(matmul_desc);
+    };
+
+    auto check = [&](cublasStatus_t st, const char* msg) {
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            cleanup();
+            throw std::runtime_error(std::string(msg) + std::to_string(static_cast<int>(st)));
+        }
+    };
+
+    check(cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F),
+          "cublasLtMatmulDescCreate: ");
+    check(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)),
+          "set TRANSA: ");
+    check(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)),
+          "set TRANSB: ");
+
+    if (bias_ptr) {
+        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        check(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                             &epilogue, sizeof(epilogue)), "set EPILOGUE: ");
+        check(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                             &bias_ptr, sizeof(bias_ptr)), "set BIAS_POINTER: ");
     }
+
+    // Matrix layouts (col-major sizes for cublasLt)
+    check(cublasLtMatrixLayoutCreate(&layout_A, CUDA_R_32F,
+          opA == CUBLAS_OP_N ? m : k, opA == CUBLAS_OP_N ? k : m, lda), "layout_A: ");
+    check(cublasLtMatrixLayoutCreate(&layout_B, CUDA_R_32F,
+          opB == CUBLAS_OP_N ? k : n, opB == CUBLAS_OP_N ? n : k, ldb), "layout_B: ");
+    check(cublasLtMatrixLayoutCreate(&layout_C, CUDA_R_32F, m, n, ldc), "layout_C: ");
+
+    constexpr size_t kWsBytes = 32 * 1024 * 1024;
+    check(cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate: ");
+    size_t wsz = kWsBytes;
+    check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &wsz, sizeof(wsz)), "set WS: ");
+
+    cublasLtMatmulHeuristicResult_t hr{};
+    int nr = 0;
+    cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(lt, matmul_desc,
+                             layout_A, layout_B, layout_C, layout_C, pref, 1, &hr, &nr);
+    if (hst != CUBLAS_STATUS_SUCCESS || nr == 0) {
+        cleanup();
+        throw std::runtime_error("cublasLtMatmulAlgoGetHeuristic: no algo");
+    }
+
+    // Shared workspace from PyTorch allocator
+    auto ws_tensor = torch::empty({static_cast<int64_t>(kWsBytes)},
+                        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kUInt8));
+
+    check(cublasLtMatmul(lt, matmul_desc,
+                         &alpha, A, layout_A,
+                                 B, layout_B,
+                         &beta,  C, layout_C,
+                                 C, layout_C,
+                         &hr.algo,
+                         ws_tensor.data_ptr(), kWsBytes,
+                         stream), "cublasLtMatmul: ");
+
+    cleanup();
 }
 
 }  // namespace
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// cuBLAS TF32 Forward: Y = X @ W^T + bias
+// cuBLAS LT Forward: Y = X @ W^T + bias  (fused, single kernel)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 torch::Tensor siblas_cublas_linear_forward(
@@ -460,41 +566,41 @@ torch::Tensor siblas_cublas_linear_forward(
     TORCH_CHECK(weight.size(1) == K,
                 "weight K dimension mismatch: expected ", K, " got ", weight.size(1));
 
-    auto input_c = input.contiguous();
+    auto input_c  = input.contiguous();
     auto weight_c = weight.contiguous();
-
-    auto output = torch::empty({M, N}, input.options());
+    auto output   = torch::empty({M, N}, input.options());
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // Y = X @ W^T
-    // Row-major in cuBLAS col-major convention:
-    //   Y[N,M] = W[N,K] @ X[K,M]
-    //   W[N,K] row-major = W stored as [K,N] col-major, need CUBLAS_OP_T on lda=K
-    //   X[M,K] row-major = X stored as [K,M] col-major, CUBLAS_OP_N with lda=K
-    //   Y[M,N] row-major = Y stored as [N,M] col-major, ldc=N
-    run_cublas_gemm(
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        1.0f, 0.0f,
-        weight_c.data_ptr<float>(), K,   // W[N,K] row-major -> lda=K
-        input_c.data_ptr<float>(),  K,   // X[M,K] row-major -> ldb=K
-        output.data_ptr<float>(),   N,   // Y[M,N] row-major -> ldc=N
-        stream);
-
-    // Add bias if provided
+    const float* bias_ptr = nullptr;
+    torch::Tensor bias_c;
     if (bias.defined() && bias.numel() > 0) {
         TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
         TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
         TORCH_CHECK(bias.size(0) == N, "bias size mismatch");
-        output.add_(bias.unsqueeze(0));
+        bias_c   = bias.contiguous();
+        bias_ptr = bias_c.data_ptr<float>();
     }
+
+    // Y = X @ W^T + bias in cuBLAS col-major:
+    //   Y[N,M] = W[N,K](T) @ X[K,M](N)
+    //   W[N,K] row-major -> stored [K,N] col-major, lda=K, opA=CUBLAS_OP_T
+    //   X[M,K] row-major -> stored [K,M] col-major, ldb=K, opB=CUBLAS_OP_N
+    //   Y[M,N] row-major -> stored [N,M] col-major, ldc=N
+    run_cublaslt_gemm_bias(
+        N, M, K,
+        1.0f, 0.0f,
+        weight_c.data_ptr<float>(), K, CUBLAS_OP_T,
+        input_c.data_ptr<float>(),  K, CUBLAS_OP_N,
+        output.data_ptr<float>(),   N,
+        bias_ptr,
+        stream);
 
     return output;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// cuBLAS TF32 Backward
+// cuBLAS LT Backward
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_cublas_linear_backward(
@@ -512,44 +618,42 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> siblas_cublas_linear_bac
     const int K = weight.size(1);
 
     auto grad_output_c = grad_output.contiguous();
-    auto input_c = input.contiguous();
-    auto weight_c = weight.contiguous();
+    auto input_c       = input.contiguous();
+    auto weight_c      = weight.contiguous();
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // ---- grad_input = grad_output @ W -> [M, K] ----
+    // ---- grad_input = dY @ W -> [M, K] ----
     // Row-major: dX[M,K] = dY[M,N] @ W[N,K]
     // cuBLAS col-major: dX[K,M] = W^T[K,N] @ dY[N,M]
-    //   W[N,K] row-major stored as [K,N] col-major, CUBLAS_OP_N, lda=K
-    //   dY[M,N] row-major stored as [N,M] col-major, CUBLAS_OP_N, ldb=N
-    //   dX[M,K] row-major stored as [K,M] col-major, ldc=K
+    //   W[N,K] row -> lda=K, opA=N  => W[K,N] col, used as W (not transposed in col-major sense)
+    //   dY[M,N] row -> ldb=N, opB=N
+    //   dX[M,K] row -> ldc=K
     auto grad_input = torch::empty({M, K}, input.options());
-    run_cublas_gemm(
-        CUBLAS_OP_N, CUBLAS_OP_N,
+    run_cublaslt_gemm_bias(
         K, M, N,
         1.0f, 0.0f,
-        weight_c.data_ptr<float>(),      K,   // W[N,K] row-major -> lda=K
-        grad_output_c.data_ptr<float>(), N,   // dY[M,N] row-major -> ldb=N
-        grad_input.data_ptr<float>(),    K,   // dX[M,K] row-major -> ldc=K
-        stream);
+        weight_c.data_ptr<float>(),      K, CUBLAS_OP_N,
+        grad_output_c.data_ptr<float>(), N, CUBLAS_OP_N,
+        grad_input.data_ptr<float>(),    K,
+        nullptr, stream);
 
-    // ---- grad_weight = grad_output^T @ input -> [N, K] ----
-    // Row-major dW[N,K] = col-major [K,N]
-    // dW = dY^T @ X
-    // cuBLAS: C(K,N) = op(A)(K,M) * op(B)(M,N)
-    //   op(A) = X[M,K]_row = [K,M]_col, CUBLAS_OP_N -> (K,M)
-    //   op(B) = dY[M,N]_row = [N,M]_col, CUBLAS_OP_T -> (M,N)
+    // ---- grad_weight = dY^T @ X -> [N, K] ----
+    // dW[N,K] = dY^T[N,M] @ X[M,K]
+    // cuBLAS col-major: dW[K,N] = X[K,M](N) @ dY[N,M](T)
+    //   X[M,K] row -> lda=K, opA=N
+    //   dY[M,N] row -> ldb=N, opB=T -> (M,N) transposed
+    //   dW[N,K] row -> ldc=K
     auto grad_weight = torch::empty({N, K}, weight.options());
-    run_cublas_gemm(
-        CUBLAS_OP_N, CUBLAS_OP_T,
+    run_cublaslt_gemm_bias(
         K, N, M,
         1.0f, 0.0f,
-        input_c.data_ptr<float>(),       K,   // X[M,K] row-major -> lda=K
-        grad_output_c.data_ptr<float>(), N,   // dY[M,N] row-major -> ldb=N
-        grad_weight.data_ptr<float>(),   K,   // dW[N,K] row-major -> ldc=K
-        stream);
+        input_c.data_ptr<float>(),       K, CUBLAS_OP_N,
+        grad_output_c.data_ptr<float>(), N, CUBLAS_OP_T,
+        grad_weight.data_ptr<float>(),   K,
+        nullptr, stream);
 
-    // ---- grad_bias = sum(grad_output, dim=0) -> [N] ----
+    // ---- grad_bias = sum(dY, dim=0) -> [N] ----
     auto grad_bias = grad_output.sum(0);
 
     return std::make_tuple(grad_input, grad_weight, grad_bias);
