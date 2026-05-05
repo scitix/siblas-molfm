@@ -45,21 +45,13 @@ using OperatorClass       = cutlass::arch::OpClassTensorOp;
 constexpr int Alignment   = 128 / cutlass::sizeof_bits<float>::value;  // 4
 
 using ClusterShape        = Shape<_2,_1,_1>;
-using MmaTileShape        = Shape<_256,_128,_16>;
+using MmaTileShape        = Shape<_256,_64,_32>;
 
-using MainloopSchedule    = cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100;
-
-// Fused bias epilogue operation: D = alpha * acc + beta * C + row-bias
-using FusedBiasOp = cutlass::epilogue::fusion::LinCombPerRowBias<
-    float,   // ElementOutput
-    float,   // ElementCompute
-    float,   // ElementBias
-    float,   // ElementSource (C)
-    float,   // ElementScalar
-    Alignment>;  // AlignmentBias
+// BF16x6 persistent-band constants (matches bench_gemm.cu)
+constexpr int NumBands_   = 3;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// GemmNN_Bias: A=RowMajor, B=ColMajor -> C=RowMajor  (forward, fused bias)
+// GemmNN_Bias: A=RowMajor, B=ColMajor -> D=RowMajor  (forward, fused bias)
 // D = alpha * X @ W^T + bias[n]
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -67,6 +59,44 @@ using LayoutA_NN          = cutlass::layout::RowMajor;
 using LayoutB_NN          = cutlass::layout::ColumnMajor;
 using LayoutC_NN          = cutlass::layout::RowMajor;
 
+// Fused per-row bias (row-major output: bias[n] broadcast over M rows)
+using FusedBiasOp = cutlass::epilogue::fusion::LinCombPerRowBias<
+    float,   // ElementOutput
+    float,   // ElementCompute
+    float,   // ElementBias
+    float,   // ElementSource (C)
+    float,   // ElementScalar
+    Alignment>;
+
+// StdBuilder used only to extract scheduling/pipeline parameters for OptPolicy
+using StdBuilder_NN = cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementInput, LayoutA_NN, Alignment,
+    ElementInput, LayoutB_NN, Alignment,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<1>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100>;
+
+// Optimized BF16x6 persistent-band mainloop policy (same as bench_gemm.cu)
+using OptPolicy_NN = cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedFastF32PersistentB<
+    4, 6,
+    StdBuilder_NN::SchedulerPipelineStageCount,
+    StdBuilder_NN::AccumulatorPipelineStageCount,
+    NumBands_,
+    StdBuilder_NN::ScalingFactor,
+    StdBuilder_NN::AccPromotionInterval,
+    ClusterShape,
+    typename StdBuilder_NN::AccumulatorCopyAtom>;
+
+// Plain epilogue (no bias)
+using CollectiveEpilogue_NN = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass, MmaTileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, float, LayoutC_NN, Alignment, float, LayoutC_NN, Alignment,
+    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm>::CollectiveOp;
+
+// Bias epilogue
 using CollectiveEpilogue_NN_Bias = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     MmaTileShape, ClusterShape,
@@ -78,27 +108,16 @@ using CollectiveEpilogue_NN_Bias = typename cutlass::epilogue::collective::Colle
     FusedBiasOp
   >::CollectiveOp;
 
-// Plain epilogue (no bias, used when bias is nullptr — e.g. no-bias forward)
-using CollectiveEpilogue_NN = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    MmaTileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementOutput, LayoutC_NN, Alignment,
-    ElementOutput, LayoutC_NN, Alignment,
-    cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
-  >::CollectiveOp;
-
-using CollectiveMainloop_NN = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementInput, LayoutA_NN, Alignment,
-    ElementInput, LayoutB_NN, Alignment,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue_NN::SharedStorage))>,
-    MainloopSchedule
-  >::CollectiveOp;
+// Mainloop using the optimized BF16x6 policy
+using CollectiveMainloop_NN = cutlass::gemm::collective::CollectiveMma<
+    OptPolicy_NN, MmaTileShape, float,
+    cutlass::gemm::TagToStrideA_t<LayoutA_NN>, float,
+    cutlass::gemm::TagToStrideB_t<LayoutB_NN>,
+    typename StdBuilder_NN::TiledMma,
+    typename StdBuilder_NN::GmemTiledCopyA, typename StdBuilder_NN::SmemLayoutAtomPairA,
+    typename StdBuilder_NN::CopyAtomPairA, cute::identity,
+    typename StdBuilder_NN::GmemTiledCopyB, typename StdBuilder_NN::SmemLayoutAtomPairB,
+    typename StdBuilder_NN::CopyAtomPairB, cute::identity>;
 
 using GemmKernel_NN_Bias = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>,
@@ -123,6 +142,25 @@ using LayoutA_NT          = cutlass::layout::ColumnMajor;
 using LayoutB_NT          = cutlass::layout::RowMajor;
 using LayoutC_NT          = cutlass::layout::RowMajor;
 
+using StdBuilder_NT = cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementInput, LayoutA_NT, Alignment,
+    ElementInput, LayoutB_NT, Alignment,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<1>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100>;
+
+using OptPolicy_NT = cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedFastF32PersistentB<
+    4, 6,
+    StdBuilder_NT::SchedulerPipelineStageCount,
+    StdBuilder_NT::AccumulatorPipelineStageCount,
+    NumBands_,
+    StdBuilder_NT::ScalingFactor,
+    StdBuilder_NT::AccPromotionInterval,
+    ClusterShape,
+    typename StdBuilder_NT::AccumulatorCopyAtom>;
+
 using CollectiveEpilogue_NT = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     MmaTileShape, ClusterShape,
@@ -133,16 +171,15 @@ using CollectiveEpilogue_NT = typename cutlass::epilogue::collective::Collective
     cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
   >::CollectiveOp;
 
-using CollectiveMainloop_NT = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementInput, LayoutA_NT, Alignment,
-    ElementInput, LayoutB_NT, Alignment,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue_NT::SharedStorage))>,
-    MainloopSchedule
-  >::CollectiveOp;
+using CollectiveMainloop_NT = cutlass::gemm::collective::CollectiveMma<
+    OptPolicy_NT, MmaTileShape, float,
+    cutlass::gemm::TagToStrideA_t<LayoutA_NT>, float,
+    cutlass::gemm::TagToStrideB_t<LayoutB_NT>,
+    typename StdBuilder_NT::TiledMma,
+    typename StdBuilder_NT::GmemTiledCopyA, typename StdBuilder_NT::SmemLayoutAtomPairA,
+    typename StdBuilder_NT::CopyAtomPairA, cute::identity,
+    typename StdBuilder_NT::GmemTiledCopyB, typename StdBuilder_NT::SmemLayoutAtomPairB,
+    typename StdBuilder_NT::CopyAtomPairB, cute::identity>;
 
 using GemmKernel_NT = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>,
@@ -160,6 +197,25 @@ using LayoutA_RR          = cutlass::layout::RowMajor;
 using LayoutB_RR          = cutlass::layout::RowMajor;
 using LayoutC_RR          = cutlass::layout::RowMajor;
 
+using StdBuilder_RR = cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementInput, LayoutA_RR, Alignment,
+    ElementInput, LayoutB_RR, Alignment,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<1>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmFastFP32Sm100>;
+
+using OptPolicy_RR = cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedFastF32PersistentB<
+    4, 6,
+    StdBuilder_RR::SchedulerPipelineStageCount,
+    StdBuilder_RR::AccumulatorPipelineStageCount,
+    NumBands_,
+    StdBuilder_RR::ScalingFactor,
+    StdBuilder_RR::AccPromotionInterval,
+    ClusterShape,
+    typename StdBuilder_RR::AccumulatorCopyAtom>;
+
 using CollectiveEpilogue_RR = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     MmaTileShape, ClusterShape,
@@ -170,16 +226,15 @@ using CollectiveEpilogue_RR = typename cutlass::epilogue::collective::Collective
     cutlass::epilogue::FastF32NoSmemWarpSpecialized2Sm
   >::CollectiveOp;
 
-using CollectiveMainloop_RR = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementInput, LayoutA_RR, Alignment,
-    ElementInput, LayoutB_RR, Alignment,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue_RR::SharedStorage))>,
-    MainloopSchedule
-  >::CollectiveOp;
+using CollectiveMainloop_RR = cutlass::gemm::collective::CollectiveMma<
+    OptPolicy_RR, MmaTileShape, float,
+    cutlass::gemm::TagToStrideA_t<LayoutA_RR>, float,
+    cutlass::gemm::TagToStrideB_t<LayoutB_RR>,
+    typename StdBuilder_RR::TiledMma,
+    typename StdBuilder_RR::GmemTiledCopyA, typename StdBuilder_RR::SmemLayoutAtomPairA,
+    typename StdBuilder_RR::CopyAtomPairA, cute::identity,
+    typename StdBuilder_RR::GmemTiledCopyB, typename StdBuilder_RR::SmemLayoutAtomPairB,
+    typename StdBuilder_RR::CopyAtomPairB, cute::identity>;
 
 using GemmKernel_RR = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>,
@@ -254,7 +309,7 @@ void run_cutlass_gemm(
         throw std::runtime_error(std::string("CUTLASS run: ") + cutlass::cutlassGetStatusString(status));
 }
 
-// Forward with fused per-row bias: D = alpha * A*B + bias[n]  (beta*C term disabled / C=nullptr)
+// Forward with fused per-row bias: D = alpha * A*B + bias[n]
 void run_cutlass_gemm_bias(
     int M, int N, int K,
     const float* A, const float* B,
@@ -271,18 +326,21 @@ void run_cutlass_gemm_bias(
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 
-    // Build epilogue args using the FusionCallbacks::Arguments struct
-    using EpilogueArgs = typename GemmType::GemmKernel::CollectiveEpilogue::FusionCallbacks::Arguments;
+    using EpilogueArgs = typename GemmType::GemmKernel::CollectiveEpilogue::Arguments;
     EpilogueArgs epi_args{};
-    epi_args.alpha    = 1.0f;
-    epi_args.beta     = 0.0f;
-    epi_args.bias_ptr = bias;   // per-row bias pointer [N]
+    epi_args.thread.alpha    = 1.0f;
+    epi_args.thread.beta     = 0.0f;
+    epi_args.thread.bias_ptr = bias;
+    epi_args.ptr_C           = D;
+    epi_args.dC              = stride_D;
+    epi_args.ptr_D           = D;
+    epi_args.dD              = stride_D;
 
     typename GemmType::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
         {A, stride_A, B, stride_B},
-        {epi_args, nullptr /*C unused, beta=0*/, {}, D, stride_D}
+        epi_args
     };
 
     GemmType gemm;
