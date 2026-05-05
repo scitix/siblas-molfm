@@ -8,7 +8,7 @@ CUTLASS_VERSION = "v4.4.1"
 CUTLASS_REPO = "https://github.com/NVIDIA/cutlass.git"
 
 # Use relative path for CUTLASS directory (setuptools requires relative paths)
-CUTLASS_REL_DIR = "/volume/code/jjcheng/cutlass"
+CUTLASS_REL_DIR = "/volume/code/chengjiajun/gemm_bf16x9/third_party/cutlass"
 
 
 def ensure_cutlass():
