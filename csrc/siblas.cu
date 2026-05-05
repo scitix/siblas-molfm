@@ -65,8 +65,8 @@ using LayoutA_NN          = cutlass::layout::RowMajor;
 using LayoutB_NN          = cutlass::layout::ColumnMajor;
 using LayoutC_NN          = cutlass::layout::RowMajor;
 
-// Fused per-row bias (row-major output: bias[n] broadcast over M rows)
-using FusedBiasOp = cutlass::epilogue::fusion::LinCombPerRowBias<
+// Fused per-column bias: bias[n] broadcast over all M rows (RowMajor output D[M,N])
+using FusedBiasOp = cutlass::epilogue::fusion::LinCombPerColBias<
     float,   // ElementOutput
     float,   // ElementCompute
     float,   // ElementBias
